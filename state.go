@@ -9,10 +9,17 @@
 // applied with Do. An action only advances the machine if a handler is
 // registered for it in the current state and that handler returns no error.
 //
+// A state may own background work: Enter registers an activity that runs in
+// its own goroutine while the machine stays in that state, with a context
+// that is canceled when the machine leaves it. Activities report outcomes
+// back through Do; if the machine has moved on, the stale action is rejected
+// like any other invalid action.
+//
 // All methods are safe for concurrent use by multiple goroutines.
 package state
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -29,6 +36,8 @@ type Machine[S comparable, C any] struct {
 	state    S
 	ctx      C
 	handlers map[S]map[any]any
+	enters   map[S]func(context.Context)
+	cancel   context.CancelFunc // stops the current state's activity, if any
 }
 
 // New returns a Machine in state initial holding ctx as its context.
@@ -57,11 +66,46 @@ func (m *Machine[S, C]) On[A any](from S, fn func(*C, A) (S, error)) {
 	hs[key[A]()] = fn
 }
 
+// Enter registers fn as the entry activity of state s. Each time the machine
+// transitions into s from a different state, fn runs in its own goroutine
+// with a context that is canceled when the machine next leaves s. A handler
+// returning the state it is in is an internal transition: the activity is
+// neither canceled nor restarted, so it can keep running while actions
+// mutate the context (progress updates, coalesced input, ...).
+//
+// fn typically does work and reports the outcome with Do. The cancellation
+// happens under the machine's lock, before the next state's handlers can
+// run, so an activity that has been left behind either sees its context
+// done or has its action rejected — never both accepted. fn must return
+// once its context is done, or the goroutine leaks. Registering Enter for
+// the same state again replaces the activity used by future entries.
+//
+// Being constructed in a state is not a transition, so the initial state's
+// activity does not run at New; start machines in a quiescent state and
+// kick them off with an action. To bind another resource to the state —
+// including a child Machine — use context.AfterFunc:
+//
+//	m.Enter(Running, func(ctx context.Context) {
+//		child := newWorker()
+//		context.AfterFunc(ctx, func() { child.Do(halt{}) })
+//		...
+//	})
+func (m *Machine[S, C]) Enter(s S, fn func(ctx context.Context)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.enters == nil {
+		m.enters = make(map[S]func(context.Context))
+	}
+	m.enters[s] = fn
+}
+
 // Do applies action a. If no handler is registered for A in the current
 // state, Do reports ErrInvalid. If the handler fails, its error is returned
 // and the state is unchanged. Otherwise the machine advances to the returned
-// state and blocked Wait calls are re-evaluated. Do returns the state the
-// machine is in afterwards.
+// state and blocked Wait calls are re-evaluated. If the state changed, the
+// old state's entry activity (if running) is canceled and the new state's
+// (if registered) is started. Do returns the state the machine is in
+// afterwards.
 func (m *Machine[S, C]) Do[A any](a A) (S, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -72,6 +116,17 @@ func (m *Machine[S, C]) Do[A any](a A) (S, error) {
 	next, err := h.(func(*C, A) (S, error))(&m.ctx, a)
 	if err != nil {
 		return m.state, err
+	}
+	if next != m.state {
+		if m.cancel != nil {
+			m.cancel()
+			m.cancel = nil
+		}
+		if fn, ok := m.enters[next]; ok {
+			var ctx context.Context
+			ctx, m.cancel = context.WithCancel(context.Background())
+			go fn(ctx)
+		}
 	}
 	m.state = next
 	m.cond.Broadcast()
