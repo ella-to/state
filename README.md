@@ -4,7 +4,7 @@ A minimal, concurrency-safe finite state machine for Go, built on **generic
 methods** (Go 1.27+). No `reflect`, no code generation, no `any` assertions in
 your code — 15 ns and 0 allocations per action.
 
-The entire API is five names:
+The entire API is six names:
 
 | Name | What it does |
 |---|---|
@@ -13,6 +13,7 @@ The entire API is five names:
 | `m.Do(action)` | Apply an action; advances the state if valid |
 | `m.State()` | Read the current state |
 | `m.Wait(cond)` | Block until a condition over state + context holds |
+| `m.Enter(s, activity)` | Run a goroutine while the machine stays in a state |
 
 ## Requirements
 
@@ -193,6 +194,153 @@ Two rules for `cond`:
   This acquires the lock, runs your reader, and returns — a synchronized
   snapshot in one call.
 
+## Entry activities: async work owned by a state
+
+Sometimes entering a state should *start* something — an HTTP request, a
+timer, a worker — and leaving it should stop that thing again. `Enter`
+registers an **entry activity** for a state:
+
+```go
+m.Enter(Loading, func(ctx context.Context) {
+    data, err := fetch(ctx, url) // must return early when ctx is done
+    if err != nil {
+        m.Do(Fail{Reason: err})
+        return
+    }
+    m.Do(Finish{Output: data})
+})
+```
+
+The rules:
+
+- When the machine **transitions into the state from a different state**, the
+  activity runs in its own goroutine.
+- When the machine **leaves the state**, the activity's context is canceled.
+  This happens under the machine's lock, as part of the transition itself.
+- A handler returning the state it is already in is an **internal
+  transition**: the activity is neither canceled nor restarted. Progress
+  updates and other context-mutating self-transitions leave it running.
+- The activity reports back with plain `Do`. If the machine has moved on by
+  then, the stale action is rejected like any other invalid action — a
+  canceled fetch can never flip the machine to `Done` behind your back.
+- The activity must return once its context is done, or the goroutine leaks.
+- Being constructed in a state is not a transition, so the initial state's
+  activity does not run at `New`. Start machines in a quiescent state and
+  kick them off with an action.
+
+Three patterns fall out of this:
+
+**Cancellation is a transition.** There is no `CancelFunc` to store or pass
+around: an action that moves the machine out of the state cancels the work as
+a side effect.
+
+```go
+m.On(Loading, func(j *Job, _ Cancel) (Phase, error) { return Canceled, nil })
+// Do(Cancel{}) leaves Loading -> the fetch's ctx is canceled.
+```
+
+**Timeouts are activities.** A state can time itself out — and an action that
+leaves the state first cancels the pending timer:
+
+```go
+m.Enter(WaitingForOTP, func(ctx context.Context) {
+    select {
+    case <-time.After(30 * time.Second):
+        m.Do(Expire{})
+    case <-ctx.Done(): // the code was entered in time; stand down
+    }
+})
+```
+
+**Child machines cascade.** An activity can own other machines (or any
+resource) by binding them to its context with `context.AfterFunc`:
+
+```go
+parent.Enter(Running, func(ctx context.Context) {
+    child := newWorker()
+    context.AfterFunc(ctx, func() { child.Do(Halt{}) })
+    child.Do(Begin{})
+})
+```
+
+When the parent leaves `Running` — for any reason, including moving to a
+terminal state — the child is halted; leaving *its* state cancels *its*
+activity, which halts grandchildren bound the same way, and so on down the
+tree. Stopping a machine is not a special operation, just a transition to a
+state with no way out, so the FSM model stays pure: no `Stop` method, no
+lifecycle API.
+
+### Why not just `go` inside a handler?
+
+You can, and it doesn't deadlock: `go f()` in a handler runs `f`
+concurrently, and if `f` calls `Do` it simply blocks on the machine's mutex
+until the outer `Do` releases it. So the question is a fair one — but
+deadlock was never what `Enter` is for. It exists because spawning from a
+handler ties the work's lifetime to a **transition**, while what you almost
+always want is to tie it to a **state**. Three concrete differences:
+
+**1. The handler's `*C` must not escape into the goroutine.** A handler is
+handed the context pointer, so closing over it is one keystroke away — and
+it's a data race, because the goroutine writes outside the lock:
+
+```go
+m.On(Idle, func(j *Job, _ Start) (Phase, error) {
+    go func() { j.Result = fetch() }() // RACE: j is written outside the lock
+    return Loading, nil
+})
+```
+
+`Enter`'s activity is a `func(context.Context)` with **no** `*C` parameter,
+so this isn't discouraged — it's unexpressible. An activity reaches the
+context only through `Do` and `Wait`, which hold the lock.
+
+**2. A handler that spawns and then rejects the action leaves work running
+for a state the machine never entered.**
+
+```go
+m.On(Idle, func(j *Job, _ Start) (Phase, error) {
+    go fetch()                        // started...
+    return 0, errors.New("not ready") // ...but the machine stays in Idle
+})
+```
+
+`Enter` spawns only after the handler has returned successfully, so an
+activity can never outlive a transition that didn't happen.
+
+**3. Cancellation goes from O(1) per state to O(edges), branch-sensitive.**
+Spawning by hand means storing the `CancelFunc` in your context and calling
+it on *every* edge out of the state:
+
+```go
+type Download struct { ...; stop context.CancelFunc }
+
+m.On(Idle,    ...) // spawn site 1
+m.On(Failed,  ...) // spawn site 2 (retry) — must cancel any prior stop first
+m.On(Loading, func(d *Download, a Succeed) (Status, error) { d.stop(); ... })
+m.On(Loading, func(d *Download, _ Cancel)  (Status, error) { d.stop(); ... })
+m.On(Loading, func(d *Download, a Fail)    (Status, error) {
+    if d.Attempts >= d.MaxAttempts {
+        d.stop()            // cancel here...
+        return Failed, nil
+    }
+    return Loading, nil     // ...but NOT here: the activity keeps looping
+})
+```
+
+Five touch points for one activity, and in the last handler the cancel sits
+*inside a branch*, because whether to cancel depends on which state that
+handler happens to return. Add a sixth way out of `Loading` later and forget
+the `d.stop()`, and you get a leaked goroutine plus a stale `Do` that can
+flip the machine — with nothing to catch it. `Enter(Loading, ...)` is one
+registration that the machine cannot forget, and it enforces an invariant
+you would otherwise hold in your head: **at most one activity, belonging to
+the current state**. Re-entry can't leave two copies running.
+
+Spawning from a handler is still the right tool when the work's lifetime
+genuinely *isn't* the state's — fire-and-forget metrics, an audit log entry,
+a notification email, or anything meant to outlive the state or span several
+of them. `Enter` is for work the state owns.
+
 ## Concurrency model
 
 All methods are safe for concurrent use from any number of goroutines:
@@ -207,6 +355,11 @@ All methods are safe for concurrent use from any number of goroutines:
 - Register handlers up front, before sharing the machine, and treat the
   wiring as fixed. `On` is lock-protected so late registration won't race,
   but a transition table that changes mid-flight is hard to reason about.
+  The same goes for `Enter`.
+- Entry activities run in their own goroutines, outside the lock; only the
+  spawn/cancel bookkeeping happens inside `Do`. Because that bookkeeping is
+  part of the transition, an activity that has been left behind either sees
+  its context done or has its report rejected — never both accepted.
 
 ## Examples
 
@@ -222,6 +375,10 @@ any of them with `go run ./example/<name>`.
 | [`04-progress`](example/04-progress/main.go) | Every notification pattern: self-transitions waking waiters on context changes, a change-detecting logger, a threshold waiter on a context value, and main blocking on the terminal state — three concurrent observers on one machine. |
 | [`05-once`](example/05-once/main.go) | Racing goroutines: serialized actions, the first-wins claim pattern, and using `Do`'s error to learn whether you were the goroutine that advanced the machine. |
 | [`06-cardgame`](example/06-cardgame/main.go) | The full picture: a 4-player trick-taking game where each player goroutine `Wait`s for its turn (choosing a card inside the condition, under the lock) and advances the game with `Do`. |
+| [`07-async`](example/07-async/main.go) | `Enter` owning an async fetch: retries looping inside the activity while the `fail` handler decides retry vs give up, cancellation as a plain transition, stale results rejected by the machine, and re-entry (`Failed -> Loading`) running a fresh activity. |
+| [`08-timers`](example/08-timers/main.go) | The timeout pattern: states that advance themselves after a dwell, one activity factory reused across states, an interrupted timer canceled by leaving the state (and rejected even if it slipped through), and the quiescent-start idiom. |
+| [`09-typeahead`](example/09-typeahead/main.go) | A long-lived activity serving many queries in one stay: `Wait`-based input coalescing, handler-level stale checks (results carry the query they answer), in-flight fetches canceled by `escape`, and a replaced searcher retiring cleanly. |
+| [`10-supervisor`](example/10-supervisor/main.go) | A supervision tree: child machines bound to a parent state with `context.AfterFunc`, the recursive stop cascade, children reporting up via `Do`, and bookkeeping self-transitions in the `Stopped` state. |
 
 ## Performance
 
@@ -234,3 +391,7 @@ BenchmarkDo-16    153469406    15.51 ns/op    0 B/op    0 allocs/op
 A `Do` is a mutex lock, two map lookups keyed by state and action type, one
 type assertion, and your handler. Action dispatch never touches `reflect` —
 type identity comes from the generic type parameter itself.
+
+Entry activities cost nothing when unused: the bookkeeping only runs when a
+`Do` actually changes the state, and is a single nil-map lookup if no
+activities are registered.
