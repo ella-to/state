@@ -4,7 +4,7 @@ A minimal, concurrency-safe finite state machine for Go, built on **generic
 methods** (Go 1.27+). No `reflect`, no code generation, no `any` assertions in
 your code — 15 ns and 0 allocations per action.
 
-The entire API is six names:
+The core is six names:
 
 | Name | What it does |
 |---|---|
@@ -15,11 +15,31 @@ The entire API is six names:
 | `m.Wait(cond)` | Block until a condition over state + context holds |
 | `m.Enter(s, activity)` | Run a goroutine while the machine stays in a state |
 
+A machine can also **finish**, and it can own **child machines** — which is how
+one machine drives another:
+
+| Name | What it does |
+|---|---|
+| `m.Final(states...)` | Declare the states that complete the machine |
+| `m.Start()` | Run the initial state's activities and children |
+| `m.Stop()` | Halt the machine and its children, without a transition |
+| `m.Done()` | Channel closed once the machine has completed or stopped |
+| `m.Result()` | The state and context it came to rest in |
+| `m.Invoke(at, start, done)` | Bind a child machine to a state; its completion is a transition |
+| `m.Spawn(child, done)` | Attach a child to the machine itself, for a dynamic number of them |
+| `m.Send(action)` | Queue an action; the safe way to send from inside a handler |
+| `m.Read(fn)` | Project the state and context under the lock |
+| `m.After(s, d, action)` | Apply an action after dwelling in a state |
+
 ## Requirements
 
-Go 1.27 or newer (currently `go1.27rc1`). The `go` directive in `go.mod`
+Go 1.27 or newer (currently `go1.27rc2`). The `go` directive in `go.mod`
 handles this automatically — running any `go` command with Go 1.25+ installed
 downloads the right toolchain.
+
+Note that `gofmt` in `go1.27rc2` cannot yet parse generic method declarations
+(`method must have no type parameters`), so format-on-save will fail on
+`state.go` itself. `go build`, `go vet` and `go test` are all fine.
 
 ## Core concepts
 
@@ -183,16 +203,16 @@ Two rules for `cond`:
 
 - `m.State()` returns the current state — handy for logs and assertions.
 - There is deliberately no `Context()` getter: returning a pointer would let
-  callers mutate shared data outside the lock. To read the context, use
-  `Wait` with a condition that returns true immediately:
+  callers mutate shared data outside the lock. `Read` projects what you need
+  while holding it:
 
   ```go
-  var attempts int
-  m.Wait(func(_ Phase, j *Job) bool { attempts = j.Attempts; return true })
+  attempts := m.Read(func(_ Phase, j *Job) int { return j.Attempts })
   ```
 
-  This acquires the lock, runs your reader, and returns — a synchronized
-  snapshot in one call.
+  `Read` is a generic method in its return type, so the projection is typed —
+  no `any`, no assertion. Like a `Wait` condition, the function runs under the
+  lock and must not call other machine methods.
 
 ## Entry activities: async work owned by a state
 
@@ -224,9 +244,14 @@ The rules:
   then, the stale action is rejected like any other invalid action — a
   canceled fetch can never flip the machine to `Done` behind your back.
 - The activity must return once its context is done, or the goroutine leaks.
-- Being constructed in a state is not a transition, so the initial state's
-  activity does not run at `New`. Start machines in a quiescent state and
-  kick them off with an action.
+- Being constructed in a state is not a transition: `New` wires the machine but
+  runs nothing. `Start()` runs the initial state's activities and children, so
+  a machine that does work on entry begins when you say so — and a machine that
+  starts in a quiescent state and waits for an action never needs `Start` at
+  all.
+- Activities accumulate: registering `Enter` twice for a state gives it two
+  activities, both started on entry and canceled on exit. `After` and `Invoke`
+  add to the same set.
 
 Three patterns fall out of this:
 
@@ -240,9 +265,13 @@ m.On(Loading, func(j *Job, _ Cancel) (Phase, error) { return Canceled, nil })
 ```
 
 **Timeouts are activities.** A state can time itself out — and an action that
-leaves the state first cancels the pending timer:
+leaves the state first cancels the pending timer. `After` is that activity,
+prewritten:
 
 ```go
+m.After(WaitingForOTP, 30*time.Second, Expire{})
+
+// the same thing by hand, when the timer needs company:
 m.Enter(WaitingForOTP, func(ctx context.Context) {
     select {
     case <-time.After(30 * time.Second):
@@ -252,23 +281,105 @@ m.Enter(WaitingForOTP, func(ctx context.Context) {
 })
 ```
 
-**Child machines cascade.** An activity can own other machines (or any
-resource) by binding them to its context with `context.AfterFunc`:
+## Finishing: `Final`, `Done`, `Result`
+
+A machine can be *done*. `Final` declares which states mean that:
 
 ```go
-parent.Enter(Running, func(ctx context.Context) {
-    child := newWorker()
-    context.AfterFunc(ctx, func() { child.Do(Halt{}) })
-    child.Do(Begin{})
+w := state.New(Working, Work{})
+w.Final(Complete, Failed)
+```
+
+Entering a final state cancels the machine's activities, stops its children,
+closes `Done()` and stops the machine for good — later actions are rejected with
+`ErrStopped`. `Result()` then reports where it came to rest:
+
+```go
+w.Start()
+<-w.Done()
+stage, work := w.Result() // Complete, Work{Output: "..."}
+```
+
+`Stop()` does the same without a transition: it halts a machine wherever it
+stands. The two are deliberately different — *completing* is reported to a
+parent, *being stopped* is not. That distinction is what makes child machines
+simple (below): a parent only ever hears about children that finished on their
+own, so it never has to work out which reports to ignore.
+
+`Wait` knows about it too: it returns `ErrStopped` if the machine finishes
+before its condition holds, so a waiter can't be stranded.
+
+## Child machines: `Invoke`, `Spawn`, `Send`
+
+A child machine is just another `Machine`, held by pointer. There is no actor
+type, no registry, no `any`: a parent holds `*Machine[Stage, Work]` and a child
+can hold `*Machine[Phase, Job]` right back — both concrete, both typed.
+
+**`Invoke` binds a child to a state.** One call replaces the whole hand-rolled
+arrangement of spawning, binding, watching and reporting:
+
+```go
+p.Invoke(Step1,
+    // down: build the child from the parent's context, on entry
+    func(d *Doc) *state.Machine[Stage, Work] { return newWorker(d.Payload) },
+    // up: the child completing *is* the parent's transition
+    func(d *Doc, _ Stage, w Work) (Step, error) {
+        d.Payload = w.Output
+        return Step2, nil
+    })
+```
+
+- `start` runs under the parent's lock on entry, so it can read the parent's
+  context — and stash the child in it, if the parent needs to send to the child
+  later.
+- Leaving the state stops the child, for any reason.
+- `done` runs like a handler, receiving the child's final state and a copy of
+  its context; the state it returns is the parent's next state.
+- A child that completes *after* the parent moved on reports nothing: the
+  machine tracks which stay in the state each child belongs to, so staleness is
+  not your problem. Neither is a child that was stopped rather than completing.
+- Register `Invoke` twice on one state to give it two children, each with its
+  own `done`. Both are `Machine`s in their own right, so a child can invoke
+  grandchildren the same way — the stop cascade goes all the way down.
+
+Both `Invoke`'s type parameters are inferred from `start`, so the child's own
+`[S, C]` pair never has to be written twice.
+
+**`Spawn` binds a child to the machine instead of to a state.** Use it when the
+number of children is a runtime decision; they survive transitions and are
+stopped when the parent stops. It takes no lock on the parent's state, so it is
+safe to call from a handler — which is usually where the count comes from:
+
+```go
+m.On(Idle, func(r *Report, b boot) (Pool, error) {
+    for i, n := range b.steps {
+        m.Spawn(newWorker(i+1, n, m), func(r *Report, _ Phase, t Task) (Pool, error) {
+            r.Delivered++
+            if r.Delivered == r.Total {
+                return Finished, nil
+            }
+            return Running, nil
+        })
+    }
+    return Running, nil
 })
 ```
 
-When the parent leaves `Running` — for any reason, including moving to a
-terminal state — the child is halted; leaving *its* state cancels *its*
-activity, which halts grandchildren bound the same way, and so on down the
-tree. Stopping a machine is not a special operation, just a transition to a
-state with no way out, so the FSM model stays pure: no `Stop` method, no
-lifecycle API.
+**`Send` is how machines talk from inside handlers.** `Do` runs the handler on
+your goroutine under the target's lock, so calling it *upward* from a child's
+handler while a parent's handler is reaching *down* is a deadlock. `Send` queues
+the action and returns immediately, taking no lock on the target:
+
+```go
+w.On(Working, func(t *Task, _ step) (Phase, error) {
+    t.Step++
+    t.Pool.Send(progress{id: t.ID, step: t.Step}) // upward, from a handler
+    return Working, nil
+})
+```
+
+Queued actions are applied in order, on a goroutine of the target's own, and are
+rejected like any other action if they no longer fit the state they arrive in.
 
 ### Why not just `go` inside a handler?
 
@@ -361,6 +472,23 @@ All methods are safe for concurrent use from any number of goroutines:
   part of the transition, an activity that has been left behind either sees
   its context done or has its report rejected — never both accepted.
 
+### Locks flow down the tree
+
+With children in the picture there are several machines, so there is one rule
+about which locks may be taken while another is held: **locks only ever go from
+a parent toward its children.** From inside a handler (or an `Invoke`/`Spawn`
+`done` callback), which runs with the machine locked:
+
+- **`Send` to anything** — parent, child, sibling, itself. It queues and returns,
+  taking no lock on the target.
+- **`Do` or `Stop` your own children** is fine; that direction is down.
+- **Never `Do`, `Wait` or `Stop` upward or sideways** — use `Send`.
+- **Never `Wait`** at all; the lock you need is the one you are holding.
+
+Activities hold no lock and may call anything. Child-to-parent reports go
+through the parent's mailbox rather than its lock, so a completing child never
+blocks on its parent. Everything else follows from those two facts.
+
 ## Examples
 
 The [`example`](example) directory is a guided tour, ordered simple to
@@ -369,16 +497,17 @@ any of them with `go run ./example/<name>`.
 
 | Example | Patterns and edge cases it shows |
 |---|---|
-| [`01-trafficlight`](example/01-trafficlight/main.go) | The smallest machine: an enum state, a payload-less action cycling three states, and a `Wait` snapshot read of the context. |
+| [`01-trafficlight`](example/01-trafficlight/main.go) | The smallest machine: an enum state, a payload-less action cycling three states, and a `Read` of the context afterwards. |
 | [`02-vending`](example/02-vending/main.go) | String states, actions with payloads, both rejection paths (`ErrInvalid` vs handler errors), the same action registered in two states, and a self-transition accumulating credit. |
-| [`03-retry`](example/03-retry/main.go) | Handlers as methods on the context registered as method expressions, one action fanning out to different next states based on context (retry vs give up), errors as payloads, and terminal states as "no handlers registered". |
+| [`03-retry`](example/03-retry/main.go) | Handlers as methods on the context registered as method expressions, one action fanning out to different next states based on context (retry vs give up), errors as payloads, and terminal states as "no handlers registered" — and when to declare them `Final` instead. |
 | [`04-progress`](example/04-progress/main.go) | Every notification pattern: self-transitions waking waiters on context changes, a change-detecting logger, a threshold waiter on a context value, and main blocking on the terminal state — three concurrent observers on one machine. |
 | [`05-once`](example/05-once/main.go) | Racing goroutines: serialized actions, the first-wins claim pattern, and using `Do`'s error to learn whether you were the goroutine that advanced the machine. |
 | [`06-cardgame`](example/06-cardgame/main.go) | The full picture: a 4-player trick-taking game where each player goroutine `Wait`s for its turn (choosing a card inside the condition, under the lock) and advances the game with `Do`. |
-| [`07-async`](example/07-async/main.go) | `Enter` owning an async fetch: retries looping inside the activity while the `fail` handler decides retry vs give up, cancellation as a plain transition, stale results rejected by the machine, and re-entry (`Failed -> Loading`) running a fresh activity. |
-| [`08-timers`](example/08-timers/main.go) | The timeout pattern: states that advance themselves after a dwell, one activity factory reused across states, an interrupted timer canceled by leaving the state (and rejected even if it slipped through), and the quiescent-start idiom. |
+| [`07-async`](example/07-async/main.go) | `Enter` owning an async fetch: retries looping inside the activity while the `fail` handler decides retry vs give up, cancellation as a plain transition, stale results rejected by the machine, and re-entry (`Failed -> Loading`) running a fresh activity — the case where `Final` is the wrong tool, since a retry has to leave the terminal state. |
+| [`08-timers`](example/08-timers/main.go) | The timeout pattern in one line: `After` giving each state its own dwell, an interrupted timer canceled by leaving the state (and rejected even if it slipped through), and the quiescent-start idiom. |
 | [`09-typeahead`](example/09-typeahead/main.go) | A long-lived activity serving many queries in one stay: `Wait`-based input coalescing, handler-level stale checks (results carry the query they answer), in-flight fetches canceled by `escape`, and a replaced searcher retiring cleanly. |
-| [`10-supervisor`](example/10-supervisor/main.go) | A supervision tree: child machines bound to a parent state with `context.AfterFunc`, the recursive stop cascade, children reporting up via `Do`, and bookkeeping self-transitions in the `Stopped` state. |
+| [`10-supervisor`](example/10-supervisor/main.go) | A supervision tree: `Spawn` from a handler for a runtime number of children, workers reporting progress upward with `Send` through a typed parent pointer, the recursive stop cascade, and why a halted child needs no bookkeeping. |
+| [`11-pipeline`](example/11-pipeline/main.go) | Sequential steps driven by children: `Invoke` handing the payload down and turning each child's completion into the parent's next step, `Final`/`Done`/`Result` for awaiting the outcome, and cancel stopping the running child mid-tick. |
 
 ## Performance
 

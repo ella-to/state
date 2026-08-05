@@ -4,7 +4,7 @@
 //   - defining states as an enum and the context as a plain struct
 //   - a payload-less action (an empty struct)
 //   - Do returning the state the machine landed in
-//   - reading the context afterwards with a Wait snapshot
+//   - reading the context afterwards with Read
 package main
 
 import (
@@ -55,8 +55,8 @@ func main() {
 		fmt.Println("light is now", light)
 	}
 
-	// A Wait whose condition returns true immediately is a synchronized read.
-	var ticks int
-	m.Wait(func(_ Light, c *Clock) bool { ticks = c.Ticks; return true })
+	// Read takes the machine's lock and hands the state and context to fn,
+	// so reading is race-free without exposing the context itself.
+	ticks := m.Read(func(_ Light, c *Clock) int { return c.Ticks })
 	fmt.Println("total ticks:", ticks)
 }

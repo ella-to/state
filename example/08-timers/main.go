@@ -1,12 +1,12 @@
-// Timers as entry activities: states that advance themselves after a dwell.
+// Timers: states that advance themselves after a dwell.
 //
 // What this example shows:
-//   - the timeout pattern: Enter starts a timer, the timer Do-es an action;
-//     a state can therefore time itself out with no scheduler anywhere
-//   - one activity factory (dwell) reused across several states, each with
-//     its own duration
+//   - After(state, d, action): the timeout pattern in one line. A state can
+//     time itself out with no scheduler and no goroutine of yours anywhere
+//   - the same action reused across several states, each with its own
+//     duration — After is per state, so the durations differ freely
 //   - interrupting a pending timer: Do(emergency{}) leaves the state, which
-//     cancels the timer's context — the tick it would have sent never fires
+//     cancels the timer — the tick it would have sent never fires
 //   - the second safety net: even a tick that somehow slipped through would
 //     be rejected in Flashing with state.ErrInvalid, because Flashing has no
 //     tick handler; the machine is protected twice
@@ -33,7 +33,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -85,21 +84,13 @@ func main() {
 	m.On(Green, toFlashing)
 	m.On(Yellow, toFlashing)
 
-	// dwell returns an entry activity that ticks the machine after d —
-	// unless the state is left first, which cancels ctx and the timer with
-	// it.
-	dwell := func(d time.Duration) func(context.Context) {
-		return func(ctx context.Context) {
-			select {
-			case <-time.After(d):
-				m.Do(tick{})
-			case <-ctx.Done(): // left the state some other way; stand down
-			}
-		}
-	}
-	m.Enter(Red, dwell(600*time.Millisecond))
-	m.Enter(Green, dwell(400*time.Millisecond))
-	m.Enter(Yellow, dwell(200*time.Millisecond))
+	// After is the dwell: entering the state arms a timer that Do-es the
+	// action, and leaving the state cancels it. Written out by hand it is
+	// Enter plus a select on ctx.Done and time.After — see 07-async for that
+	// shape.
+	m.After(Red, 600*time.Millisecond, tick{})
+	m.After(Green, 400*time.Millisecond, tick{})
+	m.After(Yellow, 200*time.Millisecond, tick{})
 
 	start := time.Now()
 	m.Do(power{}) // Off -> Red starts the first timer

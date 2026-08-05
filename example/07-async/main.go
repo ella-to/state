@@ -17,6 +17,10 @@
 //     download can never flip the machine to Succeeded
 //   - re-entry: Failed -> Loading is a real state change, so a fresh
 //     activity runs (manual "try again")
+//   - why these terminal states are not Final: retry{} leaves Failed for
+//     Loading again, and a final state ends the machine for good. So they stay
+//     ordinary states, and result below blocks on a Wait condition rather than
+//     on Done. Use Final only for an outcome nothing can come back from
 /*
 
         ●  m := newDownload(fetch, attempts)

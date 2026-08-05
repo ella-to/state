@@ -58,7 +58,6 @@ func main() {
 	}
 	wg.Wait()
 
-	var owner int
-	m.Wait(func(_ Phase, t *Ticket) bool { owner = t.Owner; return true })
+	owner := m.Read(func(_ Phase, t *Ticket) int { return t.Owner })
 	fmt.Printf("final owner: worker %d\n", owner)
 }

@@ -7,7 +7,11 @@
 //     context (retry while attempts remain, otherwise give up)
 //   - actions carrying an error as payload
 //   - terminal states are simply states with no handlers: once the machine
-//     reaches Succeeded or Failed, every action gets state.ErrInvalid
+//     reaches Succeeded or Failed, every action gets state.ErrInvalid. That is
+//     enough here, where the caller drives the job and sees the outcome in the
+//     return of its own Do. Declare those states Final instead when something
+//     else has to wait for the outcome — see 11-pipeline
+//   - Read: a synchronized copy of the context once the job has settled
 /*
 
                 ●  m := state.New(Pending, Job{MaxAttempts: 5})
@@ -117,7 +121,6 @@ func main() {
 	_, err := m.Do(Start{})
 	fmt.Printf("restart after success: %v (ErrInvalid: %t)\n", err, errors.Is(err, state.ErrInvalid))
 
-	var job Job
-	m.Wait(func(_ Phase, j *Job) bool { job = *j; return true })
+	job := m.Read(func(_ Phase, j *Job) Job { return *j })
 	fmt.Printf("attempts: %d, last error: %v, output: %s\n", job.Attempts, job.LastErr, job.Output)
 }

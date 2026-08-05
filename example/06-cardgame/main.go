@@ -185,7 +185,6 @@ func main() {
 	}
 	wg.Wait()
 
-	var tricks [4]int
-	m.Wait(func(_ Phase, g *Game) bool { tricks = g.Tricks; return true })
+	tricks := m.Read(func(_ Phase, g *Game) [4]int { return g.Tricks })
 	fmt.Printf("final state: %v, tricks: %v\n", m.State(), tricks)
 }
